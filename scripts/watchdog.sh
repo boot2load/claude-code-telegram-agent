@@ -26,6 +26,34 @@ log_watchdog() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $1" >> "$LOG_FILE"
 }
 
+# Cross-platform file size (bytes)
+file_size() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    stat -f%z "$1" 2>/dev/null || echo 0
+  else
+    stat -c%s "$1" 2>/dev/null || echo 0
+  fi
+}
+
+# Rotate daemon.log if it exceeds 10 MB. Uses copy-truncate: preserves the last
+# 5000 lines and truncates in place so that append-mode writers (nohup with
+# O_APPEND) keep logging to the same inode without a sparse-file gap.
+LOG_MAX_BYTES=10485760
+LOG_TAIL_LINES=5000
+rotate_log() {
+  [ -f "$LOG_FILE" ] || return 0
+  local SIZE
+  SIZE=$(file_size "$LOG_FILE")
+  if [ "$SIZE" -gt "$LOG_MAX_BYTES" ]; then
+    local TMP
+    TMP="${LOG_FILE}.rotating"
+    tail -n "$LOG_TAIL_LINES" "$LOG_FILE" > "$TMP" 2>/dev/null || return 0
+    cat "$TMP" > "$LOG_FILE"
+    rm -f "$TMP"
+    log_watchdog "Rotated daemon.log (was ${SIZE} bytes, kept last ${LOG_TAIL_LINES} lines)"
+  fi
+}
+
 send_telegram_notification() {
   local MSG="$1"
   local _URL_FILE
@@ -59,6 +87,8 @@ while [ -f "$ACTIVE_FLAG" ]; do
 
   # Re-check active flag after sleep
   [ -f "$ACTIVE_FLAG" ] || break
+
+  rotate_log
 
   # Check poll.sh daemon
   if ! is_pid_alive "$RTVT_DIR/.poll.pid"; then

@@ -132,3 +132,31 @@ if [ -f "$_RUNTIME_ENV" ]; then
     fi
   done < "$_RUNTIME_ENV"
 fi
+
+# ── Session-identity validation (defense-in-depth) ──
+# osascript argv and tmux -t already treat these as raw strings, so injection
+# via a tampered runtime env is not directly exploitable. We still reject
+# malformed values so corrupted input fails loud instead of silently targeting
+# the wrong window or producing confusing AppleScript errors.
+if [ -n "${WINDOW_ID:-}" ] && ! [[ "$WINDOW_ID" =~ ^[0-9]+$ ]]; then
+  echo "WARN: WINDOW_ID must be numeric, ignoring: $WINDOW_ID" >&2
+  unset WINDOW_ID
+fi
+if [ -n "${WINDOW_MATCH:-}" ]; then
+  # Reject newlines/carriage returns and NUL; anything else is a valid title substring.
+  case "$WINDOW_MATCH" in
+    *$'\n'*|*$'\r'*|*$'\0'*)
+      echo "WARN: WINDOW_MATCH contains control characters, ignoring" >&2
+      unset WINDOW_MATCH
+      ;;
+  esac
+fi
+if [ -n "${TMUX_SESSION:-}" ]; then
+  # tmux session names can't contain ':' or '.' — extra paranoia against control chars.
+  case "$TMUX_SESSION" in
+    *$'\n'*|*$'\r'*|*$'\0'*|*:*|*.*)
+      echo "WARN: TMUX_SESSION contains invalid characters, ignoring" >&2
+      unset TMUX_SESSION
+      ;;
+  esac
+fi

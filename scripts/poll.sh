@@ -201,9 +201,12 @@ ASEOF
     # Windows: PowerShell Escape key injection
     local PS_SCRIPT="$SCRIPT_DIR/windows/send-escape.ps1"
     if [ -f "$PS_SCRIPT" ]; then
-      local MATCH_ARG=""
-      [ -n "$WINDOW_MATCH" ] && MATCH_ARG="-WindowMatch \"$WINDOW_MATCH\""
-      powershell.exe -ExecutionPolicy Bypass -File "$(cygpath -w "$PS_SCRIPT")" $MATCH_ARG 2>/dev/null || true
+      # Use a bash array so WINDOW_MATCH is passed as a single argv element,
+      # not subject to shell word-splitting. Quoting via -WindowMatch "…"
+      # inside a string does nothing once bash word-splits the variable.
+      local -a MATCH_ARGS=()
+      [ -n "${WINDOW_MATCH:-}" ] && MATCH_ARGS=(-WindowMatch "$WINDOW_MATCH")
+      powershell.exe -ExecutionPolicy Bypass -File "$(cygpath -w "$PS_SCRIPT")" "${MATCH_ARGS[@]}" 2>/dev/null || true
     fi
   fi
 }
@@ -321,11 +324,14 @@ for m in messages:
 " 2>/dev/null) || continue
 
   NEW_OFFSET=$(echo "$RESULT" | head -1)
-  if [ "$NEW_OFFSET" != "0" ] && [ -n "$NEW_OFFSET" ]; then
-    echo "$NEW_OFFSET" > "$OFFSET_FILE"
-    OFFSET="$NEW_OFFSET"
-
-    echo "$RESULT" | tail -n +2 | while IFS= read -r MSG; do
+  # Only advance if NEW_OFFSET is a positive integer strictly greater than OFFSET.
+  # Guards against Telegram replay/reorder and spurious resets.
+  if [[ "$NEW_OFFSET" =~ ^[0-9]+$ ]] && [ "$NEW_OFFSET" -gt "$OFFSET" ]; then
+    # IMPORTANT: do NOT write OFFSET_FILE yet — we ack AFTER successful processing.
+    # Process loop uses `< <(...)` (process substitution) rather than a pipe so
+    # that `exit 0` from __STOP__/__START__ terminates poll.sh itself, not a
+    # subshell, and so variable state persists to the parent shell.
+    while IFS= read -r MSG; do
       [ -z "$MSG" ] && continue
 
       # Truncate long messages
@@ -337,10 +343,12 @@ for m in messages:
         continue
       elif [ "$MSG" = "__STOP__" ]; then
         log "Stop requested via Telegram"
+        echo "$NEW_OFFSET" > "$OFFSET_FILE"
         "$SCRIPT_DIR/stop.sh" 2>/dev/null &
         exit 0
       elif [ "$MSG" = "__START__" ]; then
         log "Start requested via Telegram"
+        echo "$NEW_OFFSET" > "$OFFSET_FILE"
         "$SCRIPT_DIR/stop.sh" 2>/dev/null
         sleep 1
         "$SCRIPT_DIR/start.sh" 2>/dev/null &
@@ -490,11 +498,11 @@ Press ❌ 3. No to cancel" \
         fi
       fi
       sleep 1
-    done
+    done < <(echo "$RESULT" | tail -n +2)
 
     # Write to inbox as backup (errors must not crash the daemon)
     # Skip internal tags — photos, files, voice are already handled above
-    echo "$RESULT" | tail -n +2 | while IFS= read -r MSG; do
+    while IFS= read -r MSG; do
       [ -z "$MSG" ] && continue
       [ "$MSG" = "__ESCAPE__" ] && continue
       [ "$MSG" = "__IGNORE__" ] && continue
@@ -509,7 +517,13 @@ Press ❌ 3. No to cancel" \
       # Strip terminal escape sequences before writing
       _ESC=$(printf '\033')
       printf '%s' "$MSG" | sed "s/${_ESC}\[[0-9;]*[A-Za-z]//g" > "$INBOX_FILE"
-    done
+    done < <(echo "$RESULT" | tail -n +2)
+
+    # ACK only after all messages processed. If we crashed mid-loop, restart
+    # re-fetches from old offset; at-least-once delivery (duplicate possible,
+    # lost message not). Prefer duplicates over silent drops for user-typed input.
+    echo "$NEW_OFFSET" > "$OFFSET_FILE"
+    OFFSET="$NEW_OFFSET"
   fi
 
   sleep 1

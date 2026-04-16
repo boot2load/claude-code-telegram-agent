@@ -287,11 +287,14 @@ elif [[ "$OS_TYPE" == MINGW* ]] || [[ "$OS_TYPE" == MSYS* ]] || [[ "$OS_TYPE" ==
     echo "ERROR: Windows PowerShell script not found: $PS_SCRIPT" >&2
     exit 1
   fi
-  MATCH_ARG=""
-  if [ -n "$WINDOW_MATCH" ]; then
-    MATCH_ARG="-WindowMatch \"$WINDOW_MATCH\""
+  # Use a bash array so WINDOW_MATCH is passed as a single argv element.
+  # `MATCH_ARG="-WindowMatch \"$WINDOW_MATCH\""` + unquoted $MATCH_ARG only
+  # looks like quoting — bash still word-splits the variable after expansion.
+  MATCH_ARGS=()
+  if [ -n "${WINDOW_MATCH:-}" ]; then
+    MATCH_ARGS=(-WindowMatch "$WINDOW_MATCH")
   fi
-  powershell.exe -ExecutionPolicy Bypass -File "$(cygpath -w "$PS_SCRIPT")" -Message "$MESSAGE" $MATCH_ARG
+  powershell.exe -ExecutionPolicy Bypass -File "$(cygpath -w "$PS_SCRIPT")" -Message "$MESSAGE" "${MATCH_ARGS[@]}"
 else
   echo "ERROR: Unsupported OS: $OS_TYPE. Supported: macOS, Linux (tmux), Windows (Git Bash)" >&2
   exit 1
