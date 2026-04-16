@@ -820,74 +820,133 @@ def detect_notification(turns):
 
 
 def extract_approval_block(raw):
+    # Structural parser anchored on the "Do you want to" prompt line:
+    #   1. Locate the prompt.
+    #   2. Walk forward to collect the numbered options.
+    #   3. Walk backward to collect the preceding content block (action marker,
+    #      command/file path/code). Indent depth separates command-body lines
+    #      from description lines so we don't rely on uppercase-first-letter
+    #      heuristics that misclassified descriptions like "remove temp file".
+    #   4. Stop at a separator line if one is present, but don't *require* one —
+    #      the old parser returned None when the top separator was scrolled out
+    #      of the buffer.
     if "Do you want to" not in raw:
         return None
+
     lines = raw.split("\n")
-    content_lines = []
-    approval = []
-    started = False
-    in_approval = False
-    for l in lines:
-        s = l.strip()
-        if s.startswith("Esc to cancel") or s.startswith("Tab to amend"):
-            continue
-        if not started:
-            if SEP_RE.match(s):
-                started = True
-            continue
-        if "Do you want to" in s:
-            in_approval = True
-            approval.append(s)
-            continue
-        if in_approval:
-            opt = re.match(r'^[❯\s]*(\d+)\.\s+(.+)$', s)
-            if opt:
-                approval.append(f"{opt.group(1)}. {opt.group(2)}")
-            continue
-        if re.match(r'^[╌]+$', s):
-            continue
-        if SEP_RE.match(s):
-            continue
-        if s:
-            content_lines.append(s)
-    if not approval:
+    approval_idx = -1
+    for i, l in enumerate(lines):
+        if "Do you want to" in l.strip():
+            approval_idx = i
+            break
+    if approval_idx < 0:
         return None
 
+    approval = [lines[approval_idx].strip()]
+    for l in lines[approval_idx + 1:]:
+        s = l.strip()
+        if not s:
+            if len(approval) > 1:
+                break
+            continue
+        if s.startswith("Esc to") or s.startswith("Tab to"):
+            continue
+        opt = re.match(r'^[❯\s]*(\d+)\.\s+(.+)$', s)
+        if opt:
+            approval.append(f"{opt.group(1)}. {opt.group(2)}")
+        elif len(approval) > 1:
+            break
+    if len(approval) < 2:
+        return None
+
+    # Walk backward from the prompt, preserving original indent. Cap at 60 lines
+    # so a huge scrollback above the approval can't drag in unrelated text.
+    content_raw = []
+    for l in reversed(lines[max(0, approval_idx - 60):approval_idx]):
+        stripped = l.strip()
+        if SEP_RE.match(stripped):
+            if content_raw:
+                break
+            continue
+        if stripped.startswith("Esc to") or stripped.startswith("Tab to"):
+            continue
+        if re.match(r'^[╌]+$', stripped):
+            continue
+        content_raw.insert(0, l.rstrip())
+    while content_raw and not content_raw[0].strip():
+        content_raw.pop(0)
+    while content_raw and not content_raw[-1].strip():
+        content_raw.pop()
+
     action = None
-    file_path = None
+    body_start = 0
+    for i, l in enumerate(content_raw):
+        s = l.strip()
+        if s in ("Create file", "Edit file", "Bash command", "Write file", "Read file"):
+            action = s
+            body_start = i + 1
+            break
+    body = content_raw[body_start:]
+    while body and not body[0].strip():
+        body.pop(0)
+
     cmd_lines = []
     code_lines = []
     info_lines = []
-    collecting_cmd = False
-    for s in content_lines:
-        if s in ("Create file", "Edit file", "Bash command", "Write file", "Read file"):
-            action = s
-            if action == "Bash command":
-                collecting_cmd = True
-            continue
-        if re.match(r'^\s*\d+\s', s):
-            collecting_cmd = False
-            code_lines.append(s)
-            continue
-        if collecting_cmd:
+    file_path = None
+
+    if action == "Bash command":
+        # Classify line-by-line. Only the LAST non-empty body line is a
+        # candidate description — Claude's convention is command-first,
+        # description-last. Multiline commands (backslash/pipe continuations,
+        # multi-statement blocks like `git status` + `git log --oneline -5`)
+        # all stay in the command body because they aren't in last position
+        # or they carry command signals (`--flag`, `./path`, `foo/bar`).
+        body_text = [l.strip() for l in body if l.strip()]
+        for i, s in enumerate(body_text):
+            is_last = i == len(body_text) - 1
             looks_like_code = (
                 s.startswith("-") or s.startswith("'") or s.startswith('"') or
-                s.startswith("|") or s.startswith("\\") or s.startswith("d=") or
+                s.startswith("|") or s.startswith("\\") or s.startswith("./") or
                 s.startswith("import ") or s.startswith("print(") or
                 "=" in s[:15] or
-                any(c in s for c in ["{", "}", "()", "$", "`", "&&", "||", "curl", "python", "grep", "sed", "awk"])
+                any(tok in s for tok in ("{", "}", "()", "$", "`", "&&", "||",
+                                          "curl", "python", "grep", "sed", "awk"))
             )
-            looks_like_desc = len(s) < 80 and len(s) > 0 and s[0].isupper() and not looks_like_code
-            if looks_like_desc and cmd_lines:
-                collecting_cmd = False
+            first_tok = s.split(" ", 1)[0] if " " in s else s
+            is_prose_candidate = (
+                is_last
+                and cmd_lines  # never reclassify the only line as description
+                and len(s) < 80
+                and " " in s
+                and not looks_like_code
+                and "--" not in s
+                and "/" not in first_tok
+            )
+            if is_prose_candidate:
                 info_lines.append(s)
             else:
                 cmd_lines.append(s)
-            continue
-        if action and not file_path and not cmd_lines:
-            file_path = s
-            continue
-        info_lines.append(s)
+    elif action in ("Create file", "Edit file", "Write file", "Read file"):
+        for l in body:
+            s = l.strip()
+            if not s:
+                continue
+            if re.match(r'^\s*\d+\s', l):
+                code_lines.append(s)
+            elif not file_path:
+                file_path = s
+            else:
+                info_lines.append(s)
+    else:
+        for l in body:
+            s = l.strip()
+            if not s:
+                continue
+            if re.match(r'^\s*\d+\s', l):
+                code_lines.append(s)
+            else:
+                info_lines.append(s)
 
     msg = "🟡 Approval Required\n\n"
     if action == "Bash command" and cmd_lines:
