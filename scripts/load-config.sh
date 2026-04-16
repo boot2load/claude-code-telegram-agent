@@ -143,18 +143,20 @@ if [ -n "${WINDOW_ID:-}" ] && ! [[ "$WINDOW_ID" =~ ^[0-9]+$ ]]; then
   unset WINDOW_ID
 fi
 if [ -n "${WINDOW_MATCH:-}" ]; then
-  # Reject newlines/carriage returns and NUL; anything else is a valid title substring.
+  # Reject newlines/carriage returns. Bash strings can't represent NUL bytes,
+  # so no need to check for that — and `$'\0'` in a glob pattern silently
+  # collapses to empty, turning the pattern into one that matches everything.
   case "$WINDOW_MATCH" in
-    *$'\n'*|*$'\r'*|*$'\0'*)
+    *$'\n'*|*$'\r'*)
       echo "WARN: WINDOW_MATCH contains control characters, ignoring" >&2
       unset WINDOW_MATCH
       ;;
   esac
 fi
 if [ -n "${TMUX_SESSION:-}" ]; then
-  # tmux session names can't contain ':' or '.' — extra paranoia against control chars.
+  # tmux session names can't contain ':' or '.'.
   case "$TMUX_SESSION" in
-    *$'\n'*|*$'\r'*|*$'\0'*|*:*|*.*)
+    *$'\n'*|*$'\r'*|*:*|*.*)
       echo "WARN: TMUX_SESSION contains invalid characters, ignoring" >&2
       unset TMUX_SESSION
       ;;
