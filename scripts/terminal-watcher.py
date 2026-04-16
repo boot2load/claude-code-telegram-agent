@@ -97,6 +97,15 @@ TELEGRAM_MAX_LEN = 4096
 IDLE_TIMEOUT = config.get("idle_timeout_seconds", 300)
 HEARTBEAT_FILE = os.path.join(RTVT_DIR, ".last_heartbeat")
 
+# Shown in Telegram when an approval is detected but the terminal buffer couldn't
+# be parsed into a structured approval block. Better than silence: the user sees
+# that Claude is blocked and can check Terminal for details.
+APPROVAL_FALLBACK_TEXT = (
+    "🟡 Approval Required\n\n"
+    "Claude is waiting on a prompt but the buffer couldn't be parsed. "
+    "Check Terminal for details, then respond with ✅ / ❌."
+)
+
 with open(PID_FILE, "w") as f:
     f.write(str(os.getpid()))
 os.chmod(PID_FILE, 0o600)
@@ -1062,6 +1071,11 @@ def main():
     live_msg_text = ""
     last_user_count = 0
     prev_had_approval = False
+    # Tracks whether the current approval has actually made it to Telegram.
+    # Stays False when send_message fails OR when extract_approval_block returns
+    # None; flips True only after a successful send. Ensures we retry delivery
+    # on subsequent cycles instead of silently stalling while Claude is blocked.
+    approval_delivered = False
     task_start_time = time.time()
     tick_count = 0
     prev_state = "idle"  # Track state transitions to avoid repeated notifications
@@ -1085,6 +1099,18 @@ def main():
 
         curr_content = get_terminal_content()
         if not curr_content or curr_content == prev_content:
+            # Undelivered-approval recovery: if we previously saw an approval
+            # but never managed to send it to Telegram (parse failure or
+            # network hiccup), retry now — otherwise the user sees nothing
+            # while Claude sits blocked on the prompt.
+            if prev_had_approval and not approval_delivered and curr_content:
+                retry_block = extract_approval_block(curr_content)
+                retry_msg = retry_block or APPROVAL_FALLBACK_TEXT
+                new_id = send_message(retry_msg, notify=True)
+                if new_id:
+                    live_msg_id = new_id
+                    live_msg_text = retry_msg
+                    approval_delivered = True
             # Check idle timeout
             if not idle_notified and (time.time() - last_change_time) >= IDLE_TIMEOUT:
                 idle_minutes = int((time.time() - last_change_time) / 60)
@@ -1107,6 +1133,7 @@ def main():
                 live_msg_id = None
                 live_msg_text = ""
             task_start_time = time.time()  # Reset timer after approval
+            approval_delivered = False
             processed = preprocess_tables(curr_content)
             turns = parse_terminal(processed)
             if turns:
@@ -1125,7 +1152,10 @@ def main():
             prev_had_approval = False
             continue
 
-        if approval_block and not prev_had_approval:
+        # First-time approval detection. Enter even when extract_approval_block
+        # returned None — we fall back to a generic notice so the user always
+        # learns Claude is blocked, rather than staring at a silent Telegram.
+        if has_approval and not prev_had_approval:
             if live_msg_id:
                 state, _, _ = detect_task_state(parse_terminal(preprocess_tables(prev_content)), prev_content)
                 header_with_state = f"{header_base} {get_header_for_state('complete')}"
@@ -1136,15 +1166,29 @@ def main():
                 edit_message(live_msg_id, final)
                 live_msg_id = None
                 live_msg_text = ""
+            approval_msg = approval_block or APPROVAL_FALLBACK_TEXT
             # Approvals always push-notify the user's phone
-            live_msg_id = send_message(approval_block, notify=True)
-            if live_msg_id:
-                live_msg_text = approval_block
+            new_id = send_message(approval_msg, notify=True)
+            if new_id:
+                live_msg_id = new_id
+                live_msg_text = approval_msg
+                approval_delivered = True
+            else:
+                approval_delivered = False  # next cycle will retry
             prev_had_approval = True
             continue
 
         if has_approval:
-            if approval_block and approval_block != live_msg_text and live_msg_id:
+            # Ongoing approval — update the live message if the extracted block
+            # differs, or retry delivery if the initial send never landed.
+            if not approval_delivered or not live_msg_id:
+                approval_msg = approval_block or APPROVAL_FALLBACK_TEXT
+                new_id = send_message(approval_msg, notify=True)
+                if new_id:
+                    live_msg_id = new_id
+                    live_msg_text = approval_msg
+                    approval_delivered = True
+            elif approval_block and approval_block != live_msg_text and live_msg_id:
                 edit_message(live_msg_id, approval_block)
                 live_msg_text = approval_block
             prev_had_approval = True
