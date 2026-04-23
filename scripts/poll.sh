@@ -452,6 +452,13 @@ Press ❌ 3. No to cancel" \
           fi
           [ -n "$CAPTION" ] && INSTRUCTION="$INSTRUCTION — ${CAPTION}"
           "$SCRIPT_DIR/type-to-terminal.sh" "$INSTRUCTION" 2>/dev/null || true
+          # Inbox fallback (same reason as the PHOTO branch above)
+          mkdir -p "$RTVT_DIR/inbox"
+          INBOX_FILE=$(mktemp "$RTVT_DIR/inbox/file_XXXXXXXXXX.txt" 2>/dev/null) || INBOX_FILE=""
+          if [ -n "$INBOX_FILE" ]; then
+            chmod 600 "$INBOX_FILE"
+            printf '%s' "$INSTRUCTION" > "$INBOX_FILE"
+          fi
         else
           tg_curl "sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
@@ -464,6 +471,7 @@ Press ❌ 3. No to cancel" \
         # Sanitize and truncate caption
         CAPTION=$(echo "$PHOTO_META" | cut -d'|' -f2 | tr -cd 'A-Za-z0-9 .,;:!?()_-' | cut -c1-200)
         PHOTO_NAME="screenshot_$(date +%Y%m%d_%H%M%S).jpg"
+        log "PHOTO received: id=${PHOTO_ID:0:20}... caption=${CAPTION:0:40}"
 
         tg_curl "sendMessage" \
           -d chat_id="${TELEGRAM_CHAT_ID}" \
@@ -472,14 +480,26 @@ Press ❌ 3. No to cancel" \
 
         LOCAL_PATH=$("$SCRIPT_DIR/download-file.sh" "$PHOTO_ID" "$PHOTO_NAME" 2>/dev/null || echo "")
         if [ -n "$LOCAL_PATH" ] && [ -f "$LOCAL_PATH" ]; then
+          log "PHOTO downloaded: $LOCAL_PATH"
           tg_curl "sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=📸 Image saved: ${PHOTO_NAME}" \
             -d disable_notification=true > /dev/null 2>&1
           INSTRUCTION="Please look at this screenshot: ${LOCAL_PATH}"
           [ -n "$CAPTION" ] && INSTRUCTION="$INSTRUCTION — ${CAPTION}"
-          "$SCRIPT_DIR/type-to-terminal.sh" "$INSTRUCTION" 2>/dev/null || true
+          log "PHOTO typing: len=${#INSTRUCTION} target=${WINDOW_ID:-${WINDOW_MATCH:-Claude Code}}"
+          _TYPE_OUT=$("$SCRIPT_DIR/type-to-terminal.sh" "$INSTRUCTION" 2>&1) && _TYPE_RC=0 || _TYPE_RC=$?
+          log "PHOTO typed: rc=${_TYPE_RC} out=${_TYPE_OUT:0:200}"
+          # Inbox fallback: Claude Code's periodic check-inbox.sh picks this up
+          # even when osascript paste silently fails to reach the running Claude process.
+          mkdir -p "$RTVT_DIR/inbox"
+          INBOX_FILE=$(mktemp "$RTVT_DIR/inbox/photo_XXXXXXXXXX.txt" 2>/dev/null) || INBOX_FILE=""
+          if [ -n "$INBOX_FILE" ]; then
+            chmod 600 "$INBOX_FILE"
+            printf '%s' "$INSTRUCTION" > "$INBOX_FILE"
+          fi
         else
+          log "PHOTO download failed for id=${PHOTO_ID:0:20}..."
           tg_curl "sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="❌ Failed to download image" > /dev/null 2>&1
@@ -494,7 +514,9 @@ Press ❌ 3. No to cancel" \
             --data-urlencode "text=🚫 Blocked: potentially dangerous command detected" \
             > /dev/null 2>&1
         else
-          "$SCRIPT_DIR/type-to-terminal.sh" "$MSG" 2>/dev/null || true
+          log "TEXT typing: len=${#MSG} target=${WINDOW_ID:-${WINDOW_MATCH:-Claude Code}} preview=${MSG:0:60}"
+          _TT_OUT=$("$SCRIPT_DIR/type-to-terminal.sh" "$MSG" 2>&1) && _TT_RC=0 || _TT_RC=$?
+          log "TEXT typed: rc=${_TT_RC} out=${_TT_OUT:0:200}"
         fi
       fi
       sleep 1
